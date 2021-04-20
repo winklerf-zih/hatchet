@@ -127,7 +127,7 @@ class GraphFrame:
         return CaliperReader(filename_or_stream).read()
 
     @staticmethod
-    def from_papi(measurement_directory, filter = []):
+    def from_papi(measurement_directory, filter=[]):
         """Read in a PAPI high-level performance report.
 
         Args:
