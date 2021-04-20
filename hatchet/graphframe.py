@@ -45,7 +45,14 @@ class GraphFrame:
     and a dataframe.
     """
 
-    def __init__(self, graph, dataframe, exc_metrics=None, inc_metrics=None):
+    def __init__(
+        self,
+        graph,
+        dataframe,
+        exc_metrics=None,
+        inc_metrics=None,
+        default_metric="time",
+    ):
         """Create a new GraphFrame from a graph and a dataframe.
 
         Likely, you do not want to use this function.
@@ -75,6 +82,7 @@ class GraphFrame:
         self.dataframe = dataframe
         self.exc_metrics = [] if exc_metrics is None else exc_metrics
         self.inc_metrics = [] if inc_metrics is None else inc_metrics
+        self.default_metric = default_metric
 
     @staticmethod
     def from_hpctoolkit(dirname):
@@ -155,7 +163,7 @@ class GraphFrame:
         return PyinstrumentReader(filename).read()
 
     @staticmethod
-    def from_timemory(input=None, select=None):
+    def from_timemory(input=None, select=None, **_kwargs):
         """Read in timemory data.
 
         Links:
@@ -201,20 +209,31 @@ class GraphFrame:
                 available upon request via a GitHub Issue.
 
             select (list of str):
-                A list of strings which match the component enumeration names
+                A list of strings which match the component enumeration names, e.g. ["cpu_clock"].
+
+            per_thread (boolean):
+                Ensures that when applying filters to the graphframe, frames with
+                identical name/file/line/etc. info but from different threads are not
+                combined
+
+            per_rank (boolean):
+                Ensures that when applying filters to the graphframe, frames with
+                identical name/file/line/etc. info but from different ranks are not
+                combined
+
         """
         from .readers.timemory_reader import TimemoryReader
 
         if input is not None:
             try:
-                return TimemoryReader(input, select).read()
+                return TimemoryReader(input, select, **_kwargs).read()
             except IOError:
                 pass
         else:
             try:
                 import timemory
 
-                TimemoryReader(timemory.get(hierarchy=True), select).read()
+                TimemoryReader(timemory.get(hierarchy=True), select, **_kwargs).read()
             except ImportError:
                 print(
                     "Error! timemory could not be imported. Provide filename, file stream, or dict."
@@ -456,7 +475,11 @@ class GraphFrame:
         agg_dict = {}
         for col in df.columns.tolist():
             if col in self.exc_metrics + self.inc_metrics:
-                agg_dict[col] = np.sum
+                # use min_count=1 (default is 0) here, so sum of an all-NA
+                # series is NaN, not 0
+                # when min_count=1, sum([NaN, NaN)] = NaN
+                # when min_count=0, sum([NaN, NaN)] = 0
+                agg_dict[col] = lambda x: x.sum(min_count=1)
             else:
                 agg_dict[col] = lambda x: x.iloc[0]
 
@@ -483,7 +506,9 @@ class GraphFrame:
 
         return out_columns
 
-    def subtree_sum(self, columns, out_columns=None, function=np.sum):
+    def subtree_sum(
+        self, columns, out_columns=None, function=lambda x: x.sum(min_count=1)
+    ):
         """Compute sum of elements in subtrees.  Valid only for trees.
 
         For each row in the graph, ``out_columns`` will contain the
@@ -500,8 +525,7 @@ class GraphFrame:
             out_columns (list of str): names of columns to store results
                 (default: in place)
             function (callable): associative operator used to sum
-                elements (default: sum)
-
+                elements, sum of an all-NA series is NaN (default: sum(min_count=1))
         """
         out_columns = self._init_sum_columns(columns, out_columns)
 
@@ -513,7 +537,9 @@ class GraphFrame:
                         self.dataframe.loc[[node] + node.children, col]
                     )
 
-    def subgraph_sum(self, columns, out_columns=None, function=np.sum):
+    def subgraph_sum(
+        self, columns, out_columns=None, function=lambda x: x.sum(min_count=1)
+    ):
         """Compute sum of elements in subgraphs.
 
         For each row in the graph, ``out_columns`` will contain the
@@ -530,7 +556,7 @@ class GraphFrame:
             out_columns (list of str): names of columns to store results
                 (default: in place)
             function (callable): associative operator used to sum
-                elements (default: sum)
+                elements, sum of an all-NA series is NaN (default: sum(min_count=1))
         """
         if self.graph.is_tree():
             self.subtree_sum(columns, out_columns, function)
@@ -578,8 +604,16 @@ class GraphFrame:
         """Update inclusive columns (typically after operations that rewire the
         graph.
         """
+        # we should update inc metric only if exc metric exist
+        if not self.exc_metrics:
+            return
+
         self.inc_metrics = ["%s (inc)" % s for s in self.exc_metrics]
         self.subgraph_sum(self.exc_metrics, self.inc_metrics)
+
+    def show_metric_columns(self):
+        """Returns a list of dataframe column labels."""
+        return list(self.exc_metrics + self.inc_metrics)
 
     def unify(self, other):
         """Returns a unified graphframe.
@@ -625,7 +659,7 @@ class GraphFrame:
     )
     def tree(
         self,
-        metric_column="time",
+        metric_column=None,
         precision=3,
         name_column="name",
         expand_name=False,
@@ -639,6 +673,8 @@ class GraphFrame:
         """Format this graphframe as a tree and return the resulting string."""
         color = sys.stdout.isatty()
         shell = None
+        if metric_column is None:
+            metric_column = self.default_metric
 
         if color is False:
             try:
@@ -671,21 +707,23 @@ class GraphFrame:
             invert_colormap=invert_colormap,
         )
 
-    def to_dot(self, metric="time", name="name", rank=0, thread=0, threshold=0.0):
+    def to_dot(self, metric=None, name="name", rank=0, thread=0, threshold=0.0):
         """Write the graph in the graphviz dot format:
         https://www.graphviz.org/doc/info/lang.html
         """
+        if metric is None:
+            metric = self.default_metric
         return trees_to_dot(
             self.graph.roots, self.dataframe, metric, name, rank, thread, threshold
         )
 
-    def to_flamegraph(
-        self, metric="time", name="name", rank=0, thread=0, threshold=0.0
-    ):
+    def to_flamegraph(self, metric=None, name="name", rank=0, thread=0, threshold=0.0):
         """Write the graph in the folded stack output required by FlameGraph
         http://www.brendangregg.com/flamegraphs.html
         """
         folded_stack = ""
+        if metric is None:
+            metric = self.default_metric
 
         for root in self.graph.roots:
             for hnode in root.traverse():
@@ -760,6 +798,7 @@ class GraphFrame:
             node_dict["name"] = node_name
             node_dict["frame"] = hnode.frame.attrs
             node_dict["metrics"] = metrics_to_dict(hnode)
+            node_dict["metrics"]["_hatchet_nid"] = hnode._hatchet_nid
 
             if hnode.children and hnode not in visited:
                 visited.append(hnode)
@@ -775,7 +814,7 @@ class GraphFrame:
 
         return graph_literal
 
-    def _operator(self, other, op, *args, **kwargs):
+    def _operator(self, other, op):
         """Generic function to apply operator to two dataframes and store
         result in self.
 
@@ -794,7 +833,7 @@ class GraphFrame:
             )
         )
 
-        self.dataframe.update(op(other.dataframe[all_metrics], *args, **kwargs))
+        self.dataframe.update(op(other.dataframe[all_metrics]))
 
         return self
 
@@ -1017,7 +1056,7 @@ class GraphFrame:
         new_gf.drop_index_levels()
         return new_gf
 
-    def add(self, other, *args, **kwargs):
+    def add(self, other):
         """Returns the column-wise sum of two graphframes as a new graphframe.
 
         This graphframe is the union of self's and other's graphs, and does not
@@ -1033,9 +1072,9 @@ class GraphFrame:
         # unify copies of graphframes
         self_copy.unify(other_copy)
 
-        return self_copy._operator(other_copy, self_copy.dataframe.add, *args, **kwargs)
+        return self_copy._operator(other_copy, self_copy.dataframe.add)
 
-    def sub(self, other, *args, **kwargs):
+    def sub(self, other):
         """Returns the column-wise difference of two graphframes as a new
         graphframe.
 
@@ -1052,9 +1091,9 @@ class GraphFrame:
         # unify copies of graphframes
         self_copy.unify(other_copy)
 
-        return self_copy._operator(other_copy, self_copy.dataframe.sub, *args, **kwargs)
+        return self_copy._operator(other_copy, self_copy.dataframe.sub)
 
-    def div(self, other, *args, **kwargs):
+    def div(self, other):
         """Returns the column-wise float division of two graphframes as a new graphframe.
 
         This graphframe is the union of self's and other's graphs, and does not
@@ -1070,11 +1109,9 @@ class GraphFrame:
         # unify copies of graphframes
         self_copy.unify(other_copy)
 
-        return self_copy._operator(
-            other_copy, self_copy.dataframe.divide, *args, **kwargs
-        )
+        return self_copy._operator(other_copy, self_copy.dataframe.divide)
 
-    def mul(self, other, *args, **kwargs):
+    def mul(self, other):
         """Returns the column-wise float multiplication of two graphframes as a new graphframe.
 
         This graphframe is the union of self's and other's graphs, and does not
@@ -1090,9 +1127,7 @@ class GraphFrame:
         # unify copies of graphframes
         self_copy.unify(other_copy)
 
-        return self_copy._operator(
-            other_copy, self_copy.dataframe.multiply, *args, **kwargs
-        )
+        return self_copy._operator(other_copy, self_copy.dataframe.multiply)
 
     def __iadd__(self, other):
         """Computes column-wise sum of two graphframes and stores the result in
